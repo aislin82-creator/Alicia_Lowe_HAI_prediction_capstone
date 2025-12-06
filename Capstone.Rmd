@@ -1,0 +1,1863 @@
+---
+title: "HAI code"
+author: "Alicia Lowe"
+date: "2025-09-29"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Library selection
+
+```{r}
+library(readr) # Read in data files
+library(dplyr) # Data Cleaning
+library(tidyr) # Data Cleaning
+library(lubridate) # Change date format for Data cleaning
+library(stringr) # Concatenate character groups to allow table collapsing
+library(ggformula) # Graphing
+library(ggplot2) # Graphing 
+library(gridExtra) # Wrap graphs
+library(gt) # Create tables
+library(gtsummary)  # Create summary tables
+library(reshape2) # to create bar graph with proportion of HAI to non-HAI
+library(corrplot) # Create Correlation plots
+library(FactoMineR) # FAMD analysis
+library(factoextra) # Create FAMD variable plot
+library(caret) # Cross validation for Model selection
+library(themis) # for recipe use in caret
+library(pROC) # ROC curve analysis
+library(randomForest) # Random Forest
+library(xgboost) # XGBoost
+library(nnet) #ANN
+library(NeuralNetTools) #ANN
+```  
+
+Data
+```{r}
+#Read in dataset Except for labs which is disjointed due to size
+patients = read_csv("core_patients.csv")
+diagnoses = read_csv("diagnoses.csv.gz")
+microbiology = read_csv("microbiology.csv.gz")
+procedures = read_csv("procedures.csv.gz")
+drugs = read_csv("pharmacy.csv.gz")
+
+```
+
+```{r}
+#Look at the classes of the dataset
+glimpse(patients)
+glimpse(diagnoses)
+glimpse(microbiology)
+glimpse(procedures)
+glimpse(drugs)
+```
+
+```{r}
+#Read in dataset for labs
+labs1 = read_csv("icu_labs_part1.csv.gz")
+labs2 = read_csv("icu_labs_part2.csv.gz")
+labs3 = read_csv("icu_labs_part3.csv.gz")
+labs4 = read_csv("icu_labs_part4.csv.gz")
+```
+
+Join all the labs tables together
+```{r}
+#Merge the 4 labs tables into 1 table
+labs <- bind_rows(labs1, labs2, labs3, labs4)
+```
+
+###Data Preprocessing and Cleaning
+Missing data
+```{r, echo=FALSE}
+colSums(is.na(patients))
+colSums(is.na(diagnoses))
+colSums(is.na(microbiology))
+colSums(is.na(procedures))
+colSums(is.na(drugs))
+colSums(is.na(labs))
+```
+
+summary of data.
+```{r, echo=FALSE}
+summary(patients)
+summary(diagnoses)
+summary(diagnoses)
+summary(procedures)
+summary(drugs)
+summary(labs)
+```
+
+
+Change all characters to lower-case
+```{r}
+patients <- patients %>%
+  mutate(across(c(gender, admission_type, admission_location), ~tolower(.)))
+
+diagnoses <- diagnoses %>%
+  mutate(across(c(icd_code, diagnosis_description), ~tolower(.)))
+
+microbiology <- microbiology %>%
+  mutate(across(c(spec_type_desc, test_name, org_name, ab_name, interpretation, comments),
+                ~ tolower(.)))
+
+procedures <- procedures %>%
+  mutate(across(c(icd_code, long_title), ~tolower(.)))
+
+drugs <- drugs %>%
+  mutate(across(c(medication, route, frequency), ~tolower(.)))
+
+labs <- labs %>%
+  mutate(across(c(value, flag, label, fluid, comments), ~tolower(.)))
+
+```
+
+
+Append table names for columns for joining with duplicate column names
+```{r}
+diagnoses <- diagnoses %>%
+
+  rename_with(~ paste0(., "_diag"), 
+              .cols = -c(subject_id, hadm_id, stay_id, diagnosis_description))
+
+procedures <- procedures %>%
+  rename_with(~ paste0(., "_proc"), 
+              .cols = -c(subject_id, hadm_id, stay_id, long_title))
+
+labs <- labs %>%
+  rename_with(~ paste0(., "_lab"), 
+              .cols = -c(subject_id, hadm_id, stay_id, itemid, value, valuenum, flag,
+                         label, fluid))
+```
+
+Convert dates to date/time
+```{r}
+# Convert procedure dates 
+procedures <- procedures %>%
+  mutate(p_charttime = as.POSIXct(chartdate_proc, format = "%Y-%m-%d", tz = "UTC"))
+```
+
+##Address Missing Data
+Microbiology Missingness
+```{r}
+#Change NA in org_id where culture is in the test_name
+#AI assisted with test_name containing clostridium difficile
+microbiology <- microbiology %>%
+  mutate(
+    is_culture = grepl("culture", test_name, ignore.case = TRUE),
+    is_cdiff = grepl("clostridium difficile|c\\.? *diff", test_name, ignore.case = TRUE),
+    is_respiratory = grepl("respiratory|sputum|bronchial", spec_type_desc, ignore.case = TRUE),
+    is_catheter = grepl("urine", spec_type_desc, ignore.case = TRUE)
+  ) %>%
+  filter(is_culture | is_cdiff | is_respiratory | is_catheter) %>%
+  mutate(
+    org_name = case_when(
+      is_culture & is.na(org_name) ~ "no growth",
+      !is_culture & is.na(org_name) ~ "not culture",
+      TRUE ~ org_name
+    )
+  )
+
+```
+
+Missing susceptibility results such as ab_itemid, ab_name, interpretation are not necessary for modeling at this time will leave as is. Comments will be left as is.
+
+Pharmacy missingness
+```{r}
+#Any medication not recorded was changed to none since >5% missing
+drugs <- drugs %>%
+  mutate(medication = ifelse(is.na(medication), "none", medication))
+
+#change NA values in the route and frequency columns
+drugs <- drugs %>%
+  mutate(route = ifelse(!is.na(route), "unknown", medication))
+
+drugs <-drugs %>%
+  mutate(frequency = ifelse(!is.na(frequency), "unknown", frequency))
+
+```
+
+Labs missingness
+```{r}
+#test label is really test result field
+#Drop all columns where the result field is specimen type
+labs <- labs %>%
+  filter(!label %in% c("specimen type"))
+
+#remove columns where testing is cancelled
+labs <- labs %>%
+  filter(
+    !(grepl("cancel", value, ignore.case = TRUE) |
+      (is.na(value) & grepl("cancel|unable to report|error", comments_lab, ignore.case = TRUE)))
+  )
+
+#some values were resulted under comment. Parsed comment to Value
+labs <- labs %>%
+  mutate(
+    # AI assisted
+    value = ifelse(
+      (is.na(value) | value == "") & !is.na(comments_lab) & comments_lab != "",
+      comments_lab,
+      value
+    )
+  )
+
+colSums(is.na(labs))
+#This leaves only 856 NA columns, Okay to drop remaining as they are truly NA
+labs <- labs %>%
+  filter(!is.na(value))
+
+```
+
+Creating the HAI flag
+```{r}
+#Create the HAI flag
+#create a list of procedure ICD codes for urine caths and ventilation
+proc_times <- procedures %>%
+  mutate(
+    is_cath = icd_code_proc %in% c("5794", "5795", "9648"),
+    is_vent = icd_code_proc %in% c("9671", "9605", "9672", "9390", "9670",
+                              "5a1945z", "5a1955z", "5a1935z", "5a09457",
+                              "5a0945a", "5a09357", "5a09557", "5a0955a",
+                              "5a0935a", "5a0935z", "5a09358", "5a0945z")
+  ) %>%
+  select(stay_id, p_charttime, is_cath, is_vent)
+#Create the exclusion results
+#Organisms related to normal skin contaminates and cancelled tests
+exclude_orgs <- c("no growth",
+                  "staphylococcus, coagulase negative",
+                  "staphylococcus epidermidis", 
+                  "streptococcus anginosus",
+                  "salmonella dublin",
+                  "rothia species",
+                  "rothia mucilaginosa",
+                  "additional information to follow",
+                  "negative",
+                  "not culture")
+#Join patient table with micro table to calculate time from admission
+#Join procedure times to micro table to calculate time to test from procedure
+micro_relevant <- microbiology %>%
+  left_join(patients %>% select(stay_id, intime), by = "stay_id") %>%
+  left_join(proc_times, by = "stay_id") %>%
+  mutate(
+    time_from_icu_admit = as.numeric(difftime(charttime, intime, units = "hours")),
+    time_from_proc = as.numeric(difftime(charttime, p_charttime, units = "hours"))
+  )
+
+#Initialize the flag as "not HAI"
+micro_relevant <- micro_relevant %>%
+  mutate(HAI_flag = "not_hai")
+
+#Flag positive blood cultures
+blood_idx <- micro_relevant$spec_type_desc %in% 
+               c("blood culture", "blood culture ( myco/f lytic bottle)") &
+             micro_relevant$time_from_icu_admit > 48 &
+             !is.na(micro_relevant$org_name) &
+             !grepl("cancelled", micro_relevant$org_name) &
+             !(micro_relevant$org_name %in% exclude_orgs)
+micro_relevant$HAI_flag[blood_idx] <- "hai"
+
+#Flag C. Diff tests
+cdiff_idx <- micro_relevant$is_cdiff &
+             micro_relevant$time_from_icu_admit > 48 &
+             !is.na(micro_relevant$org_name) &
+             micro_relevant$org_name %in% c("clostridium difficile", "positive")
+micro_relevant$HAI_flag[cdiff_idx] <- "hai"
+
+#Flag urine catheter related tests
+cath_idx <- micro_relevant$is_cath &
+            grepl("urine", micro_relevant$spec_type_desc, ignore.case = TRUE) &
+            micro_relevant$time_from_proc > 72 &
+            !is.na(micro_relevant$org_name) &
+            !(micro_relevant$org_name %in% exclude_orgs)
+micro_relevant$HAI_flag[cath_idx] <- "hai"
+
+#Flag HAI ventilator related tests
+resp_idx <- micro_relevant$is_vent &
+            grepl("respiratory|sputum|bronchial", micro_relevant$spec_type_desc, ignore.case = TRUE) &
+            micro_relevant$time_from_proc > 72 &
+            !is.na(micro_relevant$org_name) &
+            !(micro_relevant$org_name %in% exclude_orgs)
+micro_relevant$HAI_flag[resp_idx] <- "hai"
+
+#change HAI_flag to factor
+micro_relevant <- micro_relevant %>%
+  mutate(
+    HAI_flag = ifelse(HAI_flag == "hai" & grepl("cancelled", org_name), "not_hai", HAI_flag),
+    HAI_flag = factor(HAI_flag, levels = c("not_hai", "hai"))
+  )
+
+```
+
+Create adjusted length of stay for patients with HAIs. HAIs would most likely prolong a patient's stay in the ICU therefore adding additional weight in modeling for icu_los falsely elevating the importance of the predictors icu_los
+```{r}
+hai_times <- micro_relevant %>%
+  filter(HAI_flag == "hai") %>%
+  group_by(stay_id) %>%
+  summarise(first_hai_time = min(charttime, na.rm = TRUE), .groups = "drop")
+
+# Join with patient data
+patients <- patients %>%
+  left_join(hai_times, by = "stay_id") %>%
+  mutate(
+    icu_los = as.numeric(difftime(outtime, intime, units = "hours")),
+    adjusted_icu_los = case_when(
+      !is.na(first_hai_time) ~ as.numeric(difftime(first_hai_time, intime, 
+                                                   units = "hours")),
+      TRUE ~ icu_los
+    )
+  )
+```
+
+Remove additional rows into 1 row per patient stay Results
+```{r}
+# Collapse microbiology table to patient-level HAI summary
+micro_patient <- micro_relevant %>%
+  group_by(stay_id, subject_id, hadm_id) %>%
+  summarise(
+    # AI assisted
+    chartdate = paste(unique(chartdate), collapse = "; "),
+    charttime = paste(unique(format(charttime, "%Y-%m-%d %H:%M:%S")), collapse = "; "),
+    spec_type_desc = paste(unique(spec_type_desc), collapse = "; "),
+    test_name = paste(unique(test_name), collapse = "; "),
+    org_name = paste(unique(org_name), collapse = "; "),
+    HAI_flag = ifelse(any(HAI_flag == "hai"), "hai", "not_hai"),
+    cath_HAI = any(is_cath, na.rm = TRUE),
+    respiratory_HAI = any(is_vent, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+```
+
+Check positivity of HAI flag
+```{r}
+#Calculating the HAI positivity rate from collapsed table.
+micro_patient %>%
+  count(HAI_flag) %>%
+  mutate(percent = n / sum(n) * 100)
+
+```
+
+Join Patient table to micro_patient table
+```{r}
+# Join patient-level features to your stay-level microbiology summary
+micro_patient <- micro_patient %>%
+  left_join(
+    patients %>% 
+      select(subject_id, gender, anchor_age, admission_type, admission_location, stay_id,
+             intime, outtime, icu_los, adjusted_icu_los),
+    by = c("stay_id", "subject_id")
+  )
+```
+
+Collapse the Diagnoses table per stay_id
+```{r}
+#Collapse diagnosis by stay
+#Create flags based on common illness associated with increase infection risks 
+diagnoses_stay <- diagnoses %>%
+  group_by(stay_id, subject_id, hadm_id) %>%
+  summarise(
+    # AI assisted
+    icd_codes = paste(unique(icd_code_diag), collapse = "; "),
+    diagnoses_text = paste(unique(diagnosis_description), collapse = "; "),
+    num_diagnoses = n(),
+    has_diabetes = any(str_detect(diagnosis_description, 
+                                  "diabetes|hyperglycemia|hypoglycemia")),
+    has_ckd = any(str_detect(diagnosis_description, 
+                             "chronic kidney|renal failure|
+                             acute kidney failure|nephropathy")),
+    has_resp = any(str_detect(diagnosis_description, 
+                              "chronic respiratory|copd|asthma|emphysema")),
+    has_ld = any(str_detect(diagnosis_description, 
+                            "liver|hepatitis|cirrhosis|hepatic|biliary")),
+    has_cancer = any(str_detect(diagnosis_description, 
+                                "cancer|carcinoma|malignant|neoplasm|lymphoma|
+                                leukemia|metastatic|tumor")),
+    has_hd = any(str_detect(diagnosis_description, 
+                            "heart|cardiac|myocardial|coronary|
+                            atrial fibrillation|hypertension|ischemic|
+                            angina|heart failure")),
+    has_hyperlipidemia = any(str_detect(diagnosis_description,
+                                        "hyperlipidemia|hypercholesterolemia|
+                                        hypertriglyceridemia")),
+    has_acute_anemia = any(str_detect(diagnosis_description, 
+                                  "acute posthemorrhagic anemia|
+                                  acute blood loss anemia")),
+    has_acidosis = any(str_detect(diagnosis_description, 
+                              "acidosis|lactic acidosis|metabolic acidosis|
+                              respiratory acidosis")),
+    has_nicotine_depend = any(str_detect(diagnosis_description, "nicotine")),
+    has_thrombocytopenia = any(str_detect(diagnosis_description, 
+                                      "thrombocytopenia|low platelet",))
+    
+                                    
+  ) %>%
+  ungroup()
+
+```
+
+Join diagnoses to micro_patient
+```{r}
+#Join to master table micro_patient
+micro_patient <- micro_patient %>%
+  left_join(diagnoses_stay, by = c("stay_id", "subject_id", "hadm_id"))
+```
+
+Add flag for missing diagnosis information
+```{r}
+colSums(is.na(micro_patient))
+micro_patient <- micro_patient %>%
+  mutate(
+    has_diabetes = ifelse(is.na(has_diabetes), 0, has_diabetes),
+    has_ckd = ifelse(is.na(has_ckd), 0, has_ckd),
+    has_resp = ifelse(is.na(has_resp), 0, has_resp),
+    has_ld = ifelse(is.na(has_ld), 0, has_ld),
+    has_cancer = ifelse(is.na(has_cancer), 0, has_cancer),
+    has_hd = ifelse(is.na(has_hd), 0, has_hd),
+    has_hyperlipidemia = ifelse(is.na(has_hyperlipidemia), 0, has_hyperlipidemia),
+    has_acute_anemia = ifelse(is.na(has_acute_anemia), 0, has_acute_anemia),
+    has_acidosis = ifelse(is.na(has_acidosis), 0, has_acidosis),
+    has_nicotine_depend = ifelse(is.na(has_nicotine_depend), 0, has_nicotine_depend),
+    has_thrombocytopenia = ifelse(is.na(has_thrombocytopenia), 0, has_thrombocytopenia),
+    num_diagnoses = ifelse(is.na(num_diagnoses), 0, num_diagnoses)
+  )
+```
+
+Only get procedures which occur prior to the infection
+```{r}
+hai_times <- micro_relevant %>%
+  filter(HAI_flag == "hai") %>%
+  group_by(stay_id) %>%
+  summarise(first_hai = min(charttime, na.rm = TRUE), .groups = "drop")
+
+procedures_hai <- procedures %>%
+  left_join(hai_times, by = "stay_id") %>%
+  mutate(before_hai = is.na(first_hai) | p_charttime < first_hai) %>%
+  filter(before_hai)
+```
+
+collapsing Procedures table
+```{r}
+#Collapse procedures table by stay and add appropriate flags of most common procedures
+procedures_stay <- procedures_hai %>%
+  mutate(
+    has_cath_urn = grepl("urinary catheter|foley|catheter", long_title, ignore.case = TRUE) | 
+                   icd_code_proc %in% c("5794", "5795", "9648"),
+    
+    has_cath_bld = grepl("venous catheter|central venous|superior vena cava", long_title, ignore.case = TRUE) |
+                   icd_code_proc %in% c("3893", "3897", "02hv33z", "9672", "3895"),
+    
+    has_vent = grepl("mechanical ventilation|intubation|ventilator
+                     |endotracheal|tracheostomy", long_title, ignore.case = TRUE) |
+               icd_code_proc %in% c("9671", "9605", "9672", "9390", "9670",
+                               "5a1945z", "5a1955z", "5a1935z", "5a09457",
+                               "5a0945a", "5a09357", "5a09557", "5a0955a",
+                               "5a0935a", "5a0935z", "5a09358", "5a0945z",
+                               "0bh17ez", "311", "0dh63uz"),
+    has_feedingtube = grepl("nutritional substance | enteral infusion", long_title,
+                            ignore.case = TRUE) |
+      icd_code_proc %in% c("966", "9915", "3e0g76z", "3e0g86z"),
+    has_bronch_biopsy = grepl("bronchus biopsy", long_title, ignore.case = TRUE) |
+      icd_code_proc %in% c("3324"),
+    
+    has_surg = grepl("surgery|operative|incision|excision|repair|transplant|biopsy|feeding|nutritional|infusion", long_title, ignore.case = TRUE) |
+               icd_code_proc %in% c("3e0g76z", "966", "3324", "0bj08zz", "0dh63uz",
+                                    "3995")
+  ) %>%
+  group_by(stay_id, subject_id, hadm_id) %>%
+  summarise(
+    has_cath_urn = as.integer(any(has_cath_urn)),
+    has_cath_bld = as.integer(any(has_cath_bld)),
+    has_vent = as.integer(any(has_vent)),
+    has_surg = as.integer(any(has_surg)),
+    has_feedingtube = as.integer(any(has_feedingtube)),
+    has_bronch_biopsy = as.integer(any(has_bronch_biopsy)),
+    num_procedures = n(),
+    first_procedure = min(p_charttime, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Join procedures stay level to master micro_patient table
+```{r}
+micro_patient <- micro_patient %>%
+  left_join(procedures_stay, by = c("stay_id", "subject_id", "hadm_id"))
+```
+
+Handle NAs not included in the procedures flags
+```{r}
+micro_patient <- micro_patient %>%
+  mutate(
+    has_cath_urn       = ifelse(is.na(has_cath_urn), 0, has_cath_urn),
+    has_cath_bld       = ifelse(is.na(has_cath_bld), 0, has_cath_bld),
+    has_vent           = ifelse(is.na(has_vent), 0, has_vent),
+    has_surg           = ifelse(is.na(has_surg), 0, has_surg),
+    has_feedingtube    = ifelse(is.na(has_feedingtube), 0, has_feedingtube),
+    has_bronch_biopsy  = ifelse(is.na(has_bronch_biopsy), 0, has_bronch_biopsy),
+    num_procedures     = ifelse(is.na(num_procedures), 0, num_procedures),
+    first_procedure = ifelse(is.na(first_procedure), NA, first_procedure)
+  )
+colSums(is.na(micro_patient))
+```
+
+Create Drug classes
+```{r}
+#Creating drug classes
+drugs <- drugs %>%
+  mutate(drug_group = case_when(
+    medication %in% c("insulin") ~ "insulin",
+    medication %in% c("glucagon") ~ "glucagon",
+    grepl("furosemide|chlorothiazide", medication, ignore.case = TRUE) ~ "diuretic",
+    grepl("chlorhexidine", medication, ignore.case = TRUE) ~ "antiseptic",
+    grepl("vaccine|vac", medication, ignore.case = TRUE) ~ "vaccine",
+    grepl("albumin", medication, ignore.case = TRUE) ~ "volume_expander",
+    grepl("potassium|magnesium|calcium|sodium|dextrose|glucose|neutra-phos|phosphate|
+          phosphorus", medication, ignore.case = TRUE) ~ "electrolytes_fluid",
+    grepl("metoprolol|amiodarone|aspirin|heparin(?!flush)|
+          warfarin|labetalol|hydralazine|atorvastatin|nitroglycerin|diltiazem|
+          vasopressin|amlodipine|nicardipine|clopidogrel|simvastatin|captopril|digoxin|
+          carvedilol", medication, ignore.case = TRUE, perl = TRUE) ~ "cardiovascular",
+    grepl("vancomycin|cefepime|piperacillin-tazobactam|ceftriaxone|cefazolin|meropenem|
+          azithromycin|metronidazole|ciprofloxacin|neomycin|polymyxin|bacitracin|
+          fluconazole|levofloxacin|ceftazidime|acyclovir", 
+          medication, ignore.case = TRUE) ~ "antibiotic",
+    grepl("acetaminophen|fentanyl|hydromorphone|morphine|oxycodone|ketorolac", medication,
+          ignore.case = TRUE) ~ "analgesic",
+    grepl("propofol|midazolam|lorazepam|dexmedetomidine|diazepam|ramelteon",
+          medication, ignore.case = TRUE) ~ "sedative",
+    grepl("quetiapine fumarate|haloperidol|trazodone|olanzapine", medication, 
+          ignore.case = TRUE) ~ "neuroleptics",
+    grepl("senna|docusate|bisacodyl|pantoprazole|famotidine|ondansetron|
+          polyethylene glycol|ranitidine|omeprazole|metoclopramide|bicarbonate|
+          milk of magnesia|lansoprazole", medication, ignore.case = TRUE) ~ "gi",
+    grepl("albuterol|ipratropium|phenylephrine|glycopyrrolate|acetylcysteine", 
+          medication, ignore.case = TRUE) ~ "respiratory",
+    grepl("levothyroxine", medication, ignore.case = TRUE) ~ "endocrine",
+    grepl("thiamine|folic acid|phytonadione|multivitamins|vitamin", medication,
+          ignore.case = TRUE) ~ "vitamin",
+    grepl("prednisone|methylprednisolone|hydrocortisone", medication, ignore.case = TRUE) 
+    ~ "steroid",
+    grepl("midodrine|epinephrine", medication, ignore.case = TRUE) ~ "vasopressors",
+    grepl("tacrolimus", medication, ignore.case = TRUE) ~ "immunosuppressants",
+    grepl("cisatracurium", medication, ignore.case = TRUE) ~ "neuromuscular",
+    grepl("diphenhydramine", medication, ignore.case = TRUE) ~ "antihistamine",
+    grepl("Heparin Flush|heparin dwell|lidocaine", medication, 
+          ignore.case = TRUE) ~ "non_therapeutic",
+    grepl("gabapentin", medication, ignore.case = TRUE) ~ "neurologic",
+    grepl("sevelamer|calcium carbonate", medication, ignore.case = 
+            TRUE) ~ "phosphate_binder",
+    grepl("none", medication, ignore.case = TRUE) ~ "none",
+    TRUE ~ "other"
+  ))
+```
+
+Find all prescriptions administered prior to HAI flag
+```{r}
+drugs_hai <- drugs %>%
+  left_join(hai_times, by = "stay_id") %>%
+  filter(is.na(first_hai) | starttime < first_hai)
+```
+
+Collapsing the Drug table
+```{r}
+#Group by stay and include drug groups
+drugs_stay <- drugs_hai %>% 
+  group_by(subject_id, hadm_id, stay_id) %>% 
+  summarise( medications = paste(unique(medication), collapse = ", "), 
+             drug_groups = paste(unique(drug_group), collapse = ", "),
+             .groups = "drop" ) %>% 
+  left_join( drugs_hai %>% 
+               distinct(subject_id, hadm_id, stay_id, drug_group) %>% 
+               mutate(flag = 1) %>% 
+               pivot_wider( names_from = drug_group, values_from = flag, 
+                            values_fill = 0 ), by = c("subject_id", "hadm_id", "stay_id") )
+```
+
+Join drug to micro_patient table
+```{r}
+#Take care of binary flag NAs by creating a list of all the flags
+drug_flags <- c("insulin", "glucagon", "diuretic", "antiseptic","vaccine", "volume_expander","electrolytes_fluid","cardiovascular", "antibiotic","analgesic", "sedative", "neuroleptics", "gi", "respiratory", "endocrine", "vitamin", "steroid", "vasopressors", "immunosuppressants", "neuromuscular", "antihistamine", "non_therapeutic", "neurologic", "phosphate_binder", "none", "other")
+
+micro_patient <- micro_patient %>%
+  left_join(drugs_stay, by = c("stay_id", "subject_id", "hadm_id"))
+
+micro_patient <- micro_patient %>%
+  mutate(across(any_of(drug_flags), ~replace_na(.x, 0)))
+
+micro_patient <- micro_patient %>%
+  mutate(drug_groups = ifelse(is.na(drug_groups), "none", drug_groups))
+```
+
+Handling NAs introduced after the join
+```{r}
+micro_patient <- micro_patient %>%
+  mutate(
+    medications = ifelse(is.na(medications), "none", medications)
+  )
+```
+
+Memory issues with labs being so large, remove unnecessary test to only the subset
+```{r}
+labs <- labs %>%
+  filter(label %in% c(
+    "glucose", "sodium", "potassium", "ph", "chloride",
+    "hemoglobin", "bicarbonate", "creatinine"
+  ))
+```
+
+##Creating flags for labs
+Clean up Glucose tests
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(value = if_else(label == "glucose",
+                    str_replace_all(value, "verified|qns to verify|greater than|
+                                    less than", ""),value),
+    value = if_else(label == "glucose", str_replace_all(value, "[><*]", ""), value),
+    value = if_else(label == "glucose", str_replace_all(value, "\\.{3,}", " "), value),
+    value = if_else(label == "glucose", str_replace_all(value, "\\s*\\.$", ""), value),
+    value = if_else(label == "glucose", str_replace_all(value, "^\\.(?=\\d)", ""), value),
+    value = if_else(label == "glucose", str_squish(value), value),
+    value = if_else(label == "glucose" & fluid == "urine" & value %in% 
+                      c("neg", "neg.", "negative", "n"), "0", value),
+    value_num = if_else(label == "glucose", suppressWarnings(as.numeric(value)),NA_real_),
+    glucose_ordered = if_else(label == "glucose", 1, 0),
+    low_glucose = case_when(
+      label == "glucose" & fluid == "blood" & !is.na(value_num) & value_num < 70 ~ 1,
+      TRUE ~ 0
+    ),
+    high_glucose = case_when(
+      label == "glucose" & fluid == "blood" & !is.na(value_num) & value_num > 100 ~ 1,
+      label == "glucose" & fluid == "urine" & (!is.na(value_num) & value_num > 100) ~ 1,
+      label == "glucose" & fluid == "urine" &
+        str_detect(value, regex("pos", ignore_case = TRUE)) ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+```
+
+Clean up Sodium Test
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(
+    value = case_when(
+      label == "sodium" & value %in% c("___", "anion gap verified.") ~ NA_character_,
+      TRUE ~ value
+    ),
+    value = if_else(label == "sodium", str_replace_all(value, "[><*]", ""), value),
+    value = if_else(label == "sodium", str_trim(value), value),
+    value_num = if_else(label == "sodium",
+                        suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    low_sodium  = if_else(label == "sodium" & !is.na(value_num) & value_num < 135, 1, 0),
+    high_sodium = if_else(label == "sodium" & !is.na(value_num) & value_num > 145, 1, 0),
+    sodium_ordered   = if_else(label == "sodium", 1, 0)
+  )
+```
+
+Clean up potassium test results
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(
+    value = case_when(
+      label == "potassium" & value %in% c("___", "verified by alternate methodology.") 
+      ~ NA_character_, TRUE ~ value),
+    value = if_else(label == "potassium", str_extract(value, "[><]?\\s*\\d+(\\.\\d+)?"),
+                    value),
+    value = if_else(label == "potassium", str_replace_all(value, "[><*]", ""), value),
+    value = if_else(label == "potassium", str_squish(value), value),
+    value_num = if_else(label == "potassium", suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    low_potassium  = if_else(label == "potassium" & !is.na(value_num) & value_num < 3.6,
+                             1, 0),
+    high_potassium = if_else(label == "potassium" & !is.na(value_num) & value_num > 5.2,
+                             1, 0),
+    potassium_ordered = if_else(label == "potassium", 1, 0)
+  )
+
+```
+
+Clean up pH test results
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(
+    value = case_when(
+      label == "ph" & value %in% c("verified.", "notdone", "___") ~ NA_character_,
+      TRUE ~ value
+    ),
+    value = if_else(label == "ph",
+                    str_replace_all(value, "verified|greater than|less than", ""),
+                    value),
+    value = if_else(label == "ph", str_replace_all(value, "[><*]", ""), value),
+    value = if_else(label == "ph", str_replace_all(value, "\\.{3,}", " "), value),
+    value = if_else(label == "ph", str_squish(value), value),
+    value_num = if_else(label == "ph",
+                        suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    ph_ordered = if_else(label == "ph", 1, 0),
+    low_ph_bld  = if_else(label == "ph" & fluid == "blood" & !is.na(value_num) & 
+                            value_num < 7.3, 1, 0),
+    high_ph_bld = if_else(label == "ph" & fluid == "blood" & !is.na(value_num) & 
+                            value_num > 7.5, 1, 0),
+    low_ph_urn  = if_else(label == "ph" & fluid == "urine"  & !is.na(value_num) &
+                            value_num < 4.5, 1, 0),
+    high_ph_urn = if_else(label == "ph" & fluid == "urine"  & !is.na(value_num) &
+                            value_num > 8.0, 1, 0)
+  )
+
+```
+
+Clean up chloride Test
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(
+    value = case_when(
+      label == "chloride" & value %in% c("___", "anion gap verified.") ~ NA_character_,
+      TRUE ~ value
+    ),
+    value = if_else(label == "chloride", str_replace_all(value, "[><*]", ""), value),
+    value = if_else(label == "chloride", str_trim(value), value),
+    value_num = if_else(label == "chloride",
+                        suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    low_chloride  = if_else(label == "chloride" & !is.na(value_num) & value_num < 98, 1, 0),
+    high_chloride = if_else(label == "chloride" & !is.na(value_num) & value_num > 107, 1, 0),
+    chloride_ordered   = if_else(label == "chloride", 1, 0)
+  )
+```
+
+Clean up hemoglobin results
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(value = case_when(label == "hemoglobin" & value %in% 
+                             c("___", "unable to reprot.", 
+                               "unable. unable to perform test.", "137.0", "96.0", "98.0")
+                           ~ NA_character_, TRUE ~ value),
+    value = if_else(label == "hemoglobin",str_extract(value, "\\d+(\\.\\d+)?"), value),
+    value = if_else(label == "hemoglobin", str_squish(value), value),
+    value_num = if_else(label == "hemoglobin", suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    hemoglobin_ordered = if_else(label == "hemoglobin", 1, 0)) %>%
+  left_join(micro_patient %>% select(stay_id, gender), by = "stay_id") %>%
+  mutate(
+    low_hemoglobin = case_when(
+      label == "hemoglobin" & gender == "m" & !is.na(value_num) & value_num < 13.2 ~ 1,
+      label == "hemoglobin" & gender == "f" & !is.na(value_num) & value_num < 11.6 ~ 1,
+      label == "hemoglobin" & !is.na(value_num) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    high_hemoglobin = case_when(
+      label == "hemoglobin" & gender == "m" & !is.na(value_num) & value_num > 16.6 ~ 1,
+      label == "hemoglobin" & gender == "f" & !is.na(value_num) & value_num > 15.0 ~ 1,
+      label == "hemoglobin" & !is.na(value_num) ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+```
+
+Clean up bicarbonate Test
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(
+    value = case_when(
+      label == "bicarbonate" & value %in% c("___") ~ NA_character_,
+      label == "bicarbonate" ~ str_replace_all(value, "[><*]", ""), 
+      TRUE ~ value  
+    ),
+    value = if_else(label == "bicarbonate", str_trim(value), value),
+    value_num = if_else(label == "bicarbonate",
+                        suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    low_bicarbonate  = if_else(label == "bicarbonate" & !is.na(value_num) & value_num 
+                               < 22, 1, 0),
+    high_bicarbonate = if_else(label == "bicarbonate" & !is.na(value_num) & value_num 
+                               > 29, 1, 0),
+    bicarbonate_ordered = if_else(label == "bicarbonate", 1, 0)
+  )
+
+```
+
+clean up creatinine test results
+```{r}
+#Remove meaning less characters, discard illogical results, add flags for abnormal results.
+labs <- labs %>%
+  mutate(value = case_when(label == "creatinine" & value %in% c("___") ~ NA_character_,
+                           TRUE ~ value),
+    value = if_else(label == "creatinine",str_replace_all(value, "[><*#]", ""), value),
+    value = if_else(label == "creatinine",str_replace(value, "\\.$", ""), value),
+    value = if_else(label == "creatinine", str_squish(value), value),
+    value_num = if_else(label == "creatinine", suppressWarnings(as.numeric(value)),
+                        NA_real_),
+    creatinine_ordered = if_else(label == "creatinine", 1, 0)) %>%
+  mutate(
+    low_creatinine = case_when(
+      label == "creatinine" & gender == "m" & !is.na(value_num) & value_num < 0.74 ~ 1,
+      label == "creatinine" & gender == "f" & !is.na(value_num) & value_num < 0.59 ~ 1,
+      label == "creatinine" & !is.na(value_num) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    high_creatinine = case_when(
+      label == "creatinine" & gender == "m" & !is.na(value_num) & value_num > 1.35 ~ 1,
+      label == "creatinine" & gender == "f" & !is.na(value_num) & value_num > 1.04 ~ 1,
+      label == "creatinine" & !is.na(value_num) ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+Find only the test ordered prior to HAI 
+```{r}
+#Only keeps the tests of interest
+select_tests <- c("glucose", "sodium", "potassium", "ph", "chloride", "hemoglobin",
+                  "bicarbonate", "creatinine")
+
+labs_col <- labs %>%
+  filter(label %in% select_tests)
+
+#Find timing for test before HAI
+labs_hai <- labs_col %>%
+  left_join(hai_times, by = "stay_id") %>%
+  filter(is.na(first_hai) | charttime_lab < first_hai)
+```
+
+Collapse labs table
+```{r}
+#Collapse table with only the tests prior to hai
+labs_stay <- labs_hai %>%
+  group_by(stay_id, subject_id, hadm_id) %>%
+  summarise(
+    # Glucose
+    low_glucose  = as.integer(any(low_glucose == 1, na.rm = TRUE)),
+    high_glucose = as.integer(any(high_glucose == 1, na.rm = TRUE)),
+    glucose_ordered   = as.integer(any(glucose_ordered == 1, na.rm = TRUE)),
+
+    # Sodium
+    low_sodium  = as.integer(any(low_sodium == 1, na.rm = TRUE)),
+    high_sodium = as.integer(any(high_sodium == 1, na.rm = TRUE)),
+    sodium_ordered   = as.integer(any(sodium_ordered == 1, na.rm = TRUE)),
+    
+    # Potassium
+    low_potassium  = as.integer(any(low_potassium == 1, na.rm = TRUE)),
+    high_potassium = as.integer(any(high_potassium == 1, na.rm = TRUE)),
+    potassium_ordered   = as.integer(any(potassium_ordered == 1, na.rm = TRUE)),
+    
+    # pH
+    low_ph_bld      = as.integer(any(low_ph_bld == 1, na.rm = TRUE)),
+    high_ph_bld     = as.integer(any(high_ph_bld == 1, na.rm = TRUE)),
+    low_ph_urn      = as.integer(any(low_ph_urn == 1, na.rm = TRUE)),
+    high_ph_urn     = as.integer(any(high_ph_urn == 1, na.rm = TRUE)),
+    ph_ordered      = as.integer(any(ph_ordered == 1, na.rm = TRUE)),
+    
+    # chloride
+    low_chloride  = as.integer(any(low_chloride == 1, na.rm = TRUE)),
+    high_chloride = as.integer(any(high_chloride == 1, na.rm = TRUE)),
+    chloride_ordered   = as.integer(any(chloride_ordered == 1, na.rm = TRUE)),
+    
+    # hemoglobin
+    low_hemoglobin = as.integer(any(low_hemoglobin == 1, na.rm = TRUE)),
+    high_hemoglobin = as.integer(any(high_hemoglobin == 1, na.rm = TRUE)),
+    hemoglobin_ordered = as.integer(any(hemoglobin_ordered == 1, na.rm = TRUE)),
+    
+    # bicarbonate
+    low_bicarbonate = as.integer(any(low_bicarbonate == 1, na.rm = TRUE)),
+    high_bicarbonate = as.integer(any(high_bicarbonate == 1, na.rm = TRUE)),
+    bicarbonate_ordered = as.integer(any(bicarbonate_ordered == 1, na.rm = TRUE)),
+   
+     # creatinine
+    low_creatinine = as.integer(any(low_creatinine == 1, na.rm = TRUE)),
+    high_creatinine = as.integer(any(high_creatinine == 1, na.rm = TRUE)),
+    creatinine_ordered = as.integer(any(creatinine_ordered == 1, na.rm = TRUE)),
+    
+    .groups = "drop"
+  )
+```
+
+Join labs to micro_patient table
+```{r}
+micro_patient <- micro_patient %>%
+  left_join(labs_stay, by = c("stay_id", "subject_id", "hadm_id"))
+```
+
+Handle NAs introduced from the join
+```{r}
+lab_flags <- c(
+  "low_glucose", "high_glucose", "glucose_ordered",
+  "low_sodium", "high_sodium", "sodium_ordered",
+  "low_potassium", "high_potassium", "potassium_ordered",
+  "low_ph_bld", "high_ph_bld", "low_ph_urn", "high_ph_urn", "ph_ordered", 
+  "low_chloride", "high_chloride", "chloride_ordered",
+  "low_hemoglobin", "high_hemoglobin", "hemoglobin_ordered",
+  "low_bicarbonate", "high_bicarbonate", "bicarbonate_ordered",
+  "low_creatinine", "high_creatinine", "creatinine_ordered"
+)
+
+micro_patient <- micro_patient %>%
+  mutate(across(all_of(lab_flags), ~ ifelse(is.na(.x), 0, .x)))
+
+```
+
+Drop unnecessary variables
+```{r}
+cols_to_drop <- c(
+  "subject_id", "hadm_id", "chartdate", "charttime", "spec_type_desc", "test_name", 
+  "org_name","intime", "outtime", "icd_codes", "diagnoses_text", "first_procedure", 
+  "medications", "has_vent", "has_cath_urn",  "drug_groups", "respiratory_HAI", "stay_id",
+  "cath_HAI", "icu_los"
+  )
+
+clean_patient <- micro_patient %>%
+  select(-all_of(cols_to_drop))
+
+```
+
+Convert categorical variables to factors
+```{r}
+#Change binary HAI flag
+clean_patient$HAI_flag <- factor(clean_patient$HAI_flag,
+                                 levels = c("hai", "not_hai"),
+                                 labels = c("hai", "not_hai"))
+clean_patient$HAI_flag <- relevel(clean_patient$HAI_flag, ref = "hai")
+
+clean_patient <- clean_patient %>%
+  mutate(
+      gender = as.factor(gender), 
+      admission_type = as.factor(admission_type), 
+      admission_location = as.factor(admission_location),
+      has_diabetes = as.factor(has_diabetes), 
+      has_ckd = as.factor(has_ckd), 
+      has_resp = as.factor(has_resp), 
+      has_ld = as.factor(has_ld), 
+      has_cancer = as.factor(has_cancer), 
+      has_hd = as.factor(has_hd),
+      has_cath_bld = as.factor(has_cath_bld), 
+      has_surg = as.factor(has_surg), 
+      has_feedingtube = as.factor(has_feedingtube), 
+      has_thrombocytopenia = as.factor(has_thrombocytopenia),
+      has_bronch_biopsy = as.factor(has_bronch_biopsy), 
+      has_acidosis = as.factor(has_acidosis), 
+      has_hyperlipidemia = as.factor(has_hyperlipidemia), 
+      has_acute_anemia = as.factor(has_acute_anemia),
+      has_nicotine_depend = as.factor(has_nicotine_depend), 
+      cardiovascular = as.factor(cardiovascular),
+      other = as.factor(other), gi = as.factor(gi), 
+      respiratory = as.factor(respiratory), 
+      diuretic = as.factor(diuretic), 
+      electrolytes_fluid = as.factor(electrolytes_fluid),
+      steroid = as.factor(steroid), 
+      sedative = as.factor(sedative), 
+      non_therapeutic = as.factor(non_therapeutic), 
+      antibiotic = as.factor(antibiotic),
+      none = as.factor(none), 
+      vitamin = as.factor(vitamin), 
+      insulin = as.factor(insulin), 
+      analgesic = as.factor(analgesic), 
+      vaccine = as.factor(vaccine), 
+      neuroleptics = as.factor(neuroleptics),
+      antiseptic = as.factor(antiseptic), 
+      glucagon = as.factor(glucagon), 
+      neurologic = as.factor(neurologic), 
+      volume_expander = as.factor(volume_expander),
+      antihistamine = as.factor(antihistamine), 
+      neuromuscular = as.factor(neuromuscular), 
+      vasopressors = as.factor(vasopressors), 
+      immunosuppressants = as.factor(immunosuppressants),
+      endocrine = as.factor(endocrine), 
+      phosphate_binder = as.factor(phosphate_binder), 
+      low_glucose = as.factor(low_glucose), 
+      high_glucose = as.factor(high_glucose), 
+      glucose_ordered = as.factor(glucose_ordered),
+      low_sodium = as.factor(low_sodium), 
+      high_sodium = as.factor(high_sodium), 
+      sodium_ordered = as.factor(sodium_ordered),
+      low_potassium = as.factor(low_potassium), 
+      high_potassium = as.factor(high_potassium), 
+      potassium_ordered = as.factor(potassium_ordered),
+      low_ph_bld = as.factor(low_ph_bld), 
+      high_ph_bld = as.factor(high_ph_bld), 
+      low_ph_urn = as.factor(low_ph_urn), 
+      high_ph_urn = as.factor(high_ph_urn), 
+      ph_ordered = as.factor(ph_ordered),
+      low_chloride = as.factor(low_chloride), 
+      high_chloride = as.factor(high_chloride), 
+      chloride_ordered = as.factor(chloride_ordered),
+      low_hemoglobin = as.factor(low_hemoglobin), 
+      high_hemoglobin = as.factor(high_hemoglobin), 
+      hemoglobin_ordered = as.factor(hemoglobin_ordered),
+      low_bicarbonate = as.factor(low_bicarbonate), 
+      high_bicarbonate = as.factor(high_bicarbonate), 
+      bicarbonate_ordered = as.factor(bicarbonate_ordered),
+      low_creatinine = as.factor(low_creatinine), 
+      high_creatinine = as.factor(high_creatinine), 
+      creatinine_ordered = as.factor(creatinine_ordered)
+    )
+
+```
+
+##Statistical comparison of HAI to Non-HAI
+```{r}
+# Remove extreme outliers
+Q1 <- quantile(clean_patient$adjusted_icu_los, 0.25, na.rm = TRUE)
+Q3 <- quantile(clean_patient$adjusted_icu_los, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+stat_patients <- clean_patient %>%
+  filter(adjusted_icu_los >= (Q1 - 1.5*IQR_val) & adjusted_icu_los <= (Q3 + 1.5*IQR_val))
+```
+
+```{r}
+#Length of stay in hours
+stat_patients %>%
+  group_by(HAI_flag) %>%
+  summarize(
+    mean_LOS = mean(adjusted_icu_los, na.rm = TRUE),
+    median_LOS = median(adjusted_icu_los, na.rm = TRUE),
+    sd_LOS = sd(adjusted_icu_los, na.rm = TRUE),
+    n = n()
+  )
+```
+
+```{r}
+#Number of Procedures
+stat_patients %>%
+  group_by(HAI_flag) %>%
+  summarize(
+    mean_proc = mean(num_procedures, na.rm = TRUE),
+    median_proc = median(num_procedures, na.rm = TRUE),
+    sd_proc = sd(num_procedures, na.rm = TRUE),
+    n = n()
+  )
+```
+
+```{r}
+#Number of diagnoses
+stat_patients %>%
+  group_by(HAI_flag) %>%
+  summarize(
+    mean_diag = mean(num_diagnoses, na.rm = TRUE),
+    median_diag = median(num_diagnoses, na.rm = TRUE),
+    sd_diag = sd(num_diagnoses, na.rm = TRUE),
+    n = n()
+  )
+```
+
+```{r}
+#patient ages
+stat_patients %>%
+  group_by(HAI_flag) %>%
+  summarize(
+    mean_age = mean(anchor_age, na.rm = TRUE),
+    median_age = median(anchor_age, na.rm = TRUE),
+    sd_age = sd(anchor_age, na.rm = TRUE),
+    n = n()
+  )
+```
+
+Summary table for variables
+```{r}
+# Find all variables that categorical
+cat_cols <- clean_patient %>%
+  select(where(is.factor)) %>%
+  select(-HAI_flag) %>% 
+  colnames()
+
+# Find all variables that continuous
+cont_cols <- clean_patient %>%
+  select(where(is.numeric)) %>% 
+  colnames()
+
+# Creat summary table with gtsummary adding appropriate values
+summary_tbl <- tbl_summary(
+  clean_patient,
+  type = list(
+    all_continuous() ~ "continuous",
+    all_categorical() ~ "categorical"
+  ),
+  statistic = list(
+    all_continuous() ~ "{mean} ({sd})",
+    all_categorical() ~ "{n} ({p}%)"
+  )
+)
+```
+
+##Exploratory Data Analysis
+Histograms to look for data distribution
+```{r, fig.width= 11}
+#decreasing the fonts for the titles and axis
+common_theme <- theme(plot.title = element_text(size = 11),
+                      axis.title.x = element_text(size = 10),
+                      axis.title.y = element_text(size = 10)) 
+
+hist_Age <- gf_histogram(~ anchor_age, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "Age Distribution") + common_theme
+
+hist_los <- gf_histogram(~ adjusted_icu_los, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "ICU Length of Stay Distribution") + common_theme
+
+hist_diag <- gf_histogram(~ num_diagnoses, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "Number of Diagnoses Distribution") + common_theme
+
+hist_proc <- gf_histogram(~ num_procedures, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "Number of Procedures Distribution") + common_theme
+
+```
+
+BoxPlots
+```{r}
+#decreasing the fonts for the titles
+boxplot_theme <- theme(plot.title = element_text(size = 10))
+                       
+box_age <- gf_boxplot(clean_patient$anchor_age ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Age") + boxplot_theme
+p2 <- gf_boxplot(clean_patient$adjusted_icu_los ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Length of Stay") + boxplot_theme
+p3 <- gf_boxplot(clean_patient$num_diagnoses ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Number of Diagnoses") + boxplot_theme
+p4 <- gf_boxplot(clean_patient$num_procedures ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Number of Procedures") + boxplot_theme
+
+#Arrange all the boxplots and histograms into a grid
+grid.arrange( hist_Age, box_age, hist_los, p2, hist_diag, p3, hist_proc, p4, ncol = 2)
+```
+
+Handle right skewness in length of stay and procedures
+```{r}
+clean_patient$icu_los_log <- log(clean_patient$adjusted_icu_los)
+
+#Some patients have zero procedures need log
+clean_patient$num_procedures_log <- log1p(clean_patient$num_procedures)
+```
+
+Remove extreme outliers
+```{r}
+#Find inter Quantile range
+Q1 <- quantile(clean_patient$icu_los_log, 0.25)
+Q3 <- quantile(clean_patient$icu_los_log, 0.75)
+IQR_val <- Q3 - Q1
+
+# Filter within 1.5*IQR
+clean_patient <- clean_patient %>%
+  filter(icu_los_log >= (Q1 - 1.5*IQR_val) & icu_los_log <= (Q3 + 1.5*IQR_val))
+```
+
+Looking at the box plot anchor ages has some outliers in the very young category. This makes sense, as most young people are considered "healthy" and therefore do not spend much time in the ICU. Since there are only about 28 values that are less than the 1st quartile and the distribution seems pretty even, it is decided to not transform these values as they will add useful variation to the model. However there is strong right skewness and many outliers in length of stay and in number of procedures performed. These variable will be transformed using natural log and 1.5*IQR applied to remove extreme outliers.
+
+Proportion of HAI to not HAI
+```{r}
+table(clean_patient$HAI_flag)
+
+# Proportion of each class
+prop.table(table(clean_patient$HAI_flag))
+```
+
+Graphs of los and procedures after transformation and outlier removal
+```{r}
+p2log <- gf_boxplot(clean_patient$icu_los_log ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Length of Stay log transform") + boxplot_theme
+p4log <- gf_boxplot(clean_patient$num_procedures_log ~ clean_patient$HAI_flag, fill = "cadetblue", color = "black") %>%
+  gf_labs(x = NULL, y = NULL, title = "Number of Procedures log transform") + boxplot_theme
+hist_los_log <- gf_histogram(~ icu_los_log, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "Log of ICU Length of Stay Distribution") + common_theme
+hist_proc_log <- gf_histogram(~ num_procedures_log, data = clean_patient, fill = "steelblue", color = "black", bins = 30) %>%
+  gf_labs(title = "Log of Number of Procedures Distribution") + common_theme
+
+grid.arrange(hist_los, hist_los_log, hist_proc, hist_proc_log, hist_Age, hist_diag)
+
+grid.arrange(box_age, p3, p2, p2log, p4, p4log,  ncol = 2)
+```
+
+BarPlots for Categorical Variables
+```{r}
+custom_colors <- scale_fill_manual(values = c("hai" = "darkorange", "not_hai" = "steelblue"))
+
+plot_variable_group <- function(df, vars, group_name) {
+  df_long <- df %>%
+    select(all_of(vars), HAI_flag) %>%
+    pivot_longer(cols = -HAI_flag, names_to = "Variable", values_to = "Value")
+   df_long <- df_long %>% mutate(Value = factor(Value))
+  
+  gf_bar(~ Value | Variable, fill = ~ HAI_flag, position = "dodge", data = df_long) %>%
+    gf_labs(title = paste("Distribution of", group_name),
+            x = "Value", y = "Count") +
+    common_theme + custom_colors +
+    facet_wrap(~ Variable, scales = "free_x")
+}
+
+demographics <- c("gender")
+diagnoses <- c("has_diabetes", "has_ckd", "has_resp", "has_ld", "has_cancer", "has_hd",
+               "has_hyperlipidemia", "has_acute_anemia", "has_acidosis",
+               "has_nicotine_depend", "has_thrombocytopenia")
+procedures <- c("has_cath_bld", "has_surg", "has_feedingtube", "has_bronch_biopsy")
+medications <- c("cardiovascular", "electrolytes_fluid", "diuretic", "respiratory",
+                 "gi", "other", "antibiotic", "non_therapeutic", "sedative", "steroid",
+                 "none","vitamin", "insulin", "analgesic", "vaccine", "neuroleptics",
+                 "antiseptic", "glucagon", "neurologic", "volume_expander",
+                 "antihistamine", "neuromuscular", "vasopressors", "immunosuppressants",
+                 "endocrine", "phosphate_binder")
+labs <- c("low_glucose", "high_glucose", "glucose_ordered",
+          "low_sodium", "high_sodium", "sodium_ordered",
+          "low_potassium", "high_potassium", "potassium_ordered",
+          "low_ph_bld", "high_ph_bld", "low_ph_urn", "high_ph_urn", "ph_ordered", 
+          "low_chloride", "high_chloride", "chloride_ordered",
+          "low_hemoglobin", "high_hemoglobin",  "hemoglobin_ordered",
+          "low_bicarbonate", "high_bicarbonate", "bicarbonate_ordered",
+          "low_creatinine", "high_creatinine",  "creatinine_ordered")
+
+plot_demo <- plot_variable_group(clean_patient, demographics, "Demographics")
+plot_diag <- plot_variable_group(clean_patient, diagnoses, "Diagnoses")
+plot_proc <- plot_variable_group(clean_patient, procedures, "Procedures")
+plot_med <- plot_variable_group(clean_patient, medications, "Medications")
+plot_labs <- plot_variable_group(clean_patient, labs, "Labs")
+plot_diag
+plot_proc
+```
+
+Drop untransformed columns
+```{r}
+clean_patient <- clean_patient %>%
+  select(-adjusted_icu_los,
+         -num_procedures)
+
+```
+
+###Inferential Statistics
+#Chi-Square Test
+```{r, warning=FALSE}
+#Create a variable with all categorical variables without predictor
+cat_cols <- clean_patient %>%
+  select(where(is.factor)) %>%
+  select(-HAI_flag) %>% 
+  colnames()
+
+# Chi-square tests
+# Create a loop to get chi-square for each variable in the categorical data variable
+chi_results <- lapply(cat_cols, function(col) {
+  tbl <- table(clean_patient[[col]], clean_patient$HAI_flag)
+  test <- chisq.test(tbl)
+  data.frame(
+    variable = col,
+    p_value = test$p.value,
+    type = "Categorical"
+  )
+}) %>% bind_rows()
+```
+
+#t-test for continuous variables
+```{r, warning=FALSE}
+#Create a variable for all the continuous variables for t-test
+cont_cols <- clean_patient %>%
+  select(where(is.numeric)) %>% 
+  colnames()
+
+# Loop through all the continuous variables to perfrom t-test
+t_results <- lapply(cont_cols, function(col) {
+  test <- t.test(clean_patient[[col]] ~ clean_patient$HAI_flag)
+  data.frame(
+    variable = col,
+    p_value = test$p.value,
+    type = "Continuous"
+  )
+}) %>% bind_rows()
+
+#Combine chi-square and t-test results
+test_results <- bind_rows(chi_results, t_results)
+
+t_results$variable_clean <- gsub("_log$", "", t_results$variable)
+
+final_tbl <- summary_tbl %>%
+  modify_table_body(
+    ~ left_join(.x, t_results, by = c("variable" = "variable_clean"))
+  )
+```
+
+#Analyze results
+```{r}
+#Varibles with the least statistical significance
+test_results %>%
+  filter(p_value > 0.05) %>% arrange(p_value)
+
+#Variable with the most statistical significance
+test_results %>%
+  filter(p_value < 0.05) %>% arrange(p_value)
+```
+
+Barplots of top 6 categorical predictors
+```{r}
+top_cats <- c("has_feedingtube", "has_surg", "antiseptic", "has_cath_bld",
+              "neuromuscular", "low_ph_bld")
+
+df_long <- melt(clean_patient, id.vars = "HAI_flag", measure.vars = top_cats)
+
+# Summarize proportions
+df_props <- df_long %>%
+  group_by(variable, value, HAI_flag) %>%
+  summarise(count = n(), .groups = "drop_last") %>%
+  mutate(prop = count / sum(count))
+
+df_label <- df_props %>% filter(HAI_flag == "hai")
+
+ggplot(df_props, aes(x = factor(value), y = prop, fill = HAI_flag)) +
+  geom_col(position = "fill") +
+  geom_text(
+    data = df_label,
+    aes(label = scales::percent(prop, accuracy = 1)),
+    position = position_fill(vjust = 0.93),
+    color = "white",
+    size = 3.75
+  ) +
+  facet_wrap(~variable, scales = "free_x") +
+  scale_fill_manual(values = c("hai" = "darkorange", "not_hai" = "steelblue")) +
+  labs(
+    title = "Proportion of HAI vs Non-HAI",
+    x = "Category Value (0 = No, 1 = Yes)",
+    y = "Proportion",
+    fill = "HAI Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.05),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+#check for multicollinearity
+```{r}
+model1 <- glm(HAI_flag ~ ., data = clean_patient, family = binomial)
+
+summary(model1)
+```
+
+#Create a cleaned correlation plot
+```{r}
+#One-hot encode categorical data
+dummy_data <- model.matrix(HAI_flag ~ . - 1, data = clean_patient)
+corr_dummy <- cor(dummy_data, use = "pairwise.complete.obs")
+
+#create a correlation plot with a cleaner cutoff and group high correlated values together
+high_corr_vars <- findCorrelation(corr_dummy, cutoff = 0.3, names = TRUE, verbose = FALSE)
+corr_reduced <- corr_dummy[high_corr_vars, high_corr_vars]
+
+# Cluster and plot
+corrplot(corr_reduced, 
+         method = "color", 
+         type = "upper", 
+         order = "hclust", 
+         tl.cex = 0.6,
+         col = colorRampPalette(c("blue", "white", "red"))(200))
+```
+
+Group together to remove redundancy and remove unnecessary variables
+```{r}
+#Remove unnecessary variables and create chem_labs
+clean_patient <- clean_patient %>%
+  select(-hemoglobin_ordered, -creatinine_ordered, -sodium_ordered, -potassium_ordered,
+         -bicarbonate_ordered, -chloride_ordered, -glucose_ordered, -ph_ordered,
+         -high_hemoglobin, -high_ph_urn, -low_ph_urn,  -low_glucose, -admission_type)
+         
+      
+```
+
+Create hospital location uniformity and remove rare transfer events
+```{r}
+#Find out frequency of hospital location and remove rare transfers
+clean_patient %>%
+  count(admission_location) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  arrange(desc(n))
+```
+
+```{r}
+#convert back to character to use case when and remove spaces for modeling. 
+#Remove low admission locations. Re-factor variable.
+clean_patient <- clean_patient %>%
+  mutate(admission_location = as.character(admission_location)) %>%
+  mutate(admission_location = case_when(
+    admission_location == "emergency room" ~ "er",
+    admission_location == "transfer from hospital" ~ "transfer",
+    admission_location == "physician referral" ~ "dr_referral",
+    admission_location == "walk-in/self referral" ~ "self_referral",
+    TRUE ~ "other"
+  )) %>%
+  mutate(admission_location = factor(admission_location,
+                                     levels = c("er", "transfer", "dr_referral",
+                                                "self_referral", "other")))
+```
+
+###FAMD
+#Scale data
+```{r}
+patient_scale <- clean_patient %>%
+  mutate(
+    anchor_age = scale(anchor_age),
+    icu_los_log = scale(icu_los_log),
+    num_diagnoses = scale(num_diagnoses),
+    num_procedures_log = scale(num_procedures_log)
+  ) 
+```
+
+```{r}
+#Remove HAI_flag and create screeplot
+famd_results <- FAMD(patient_scale %>% select(-HAI_flag), graph = FALSE)
+
+fviz_famd_var(famd_results, repel = TRUE)
+fviz_screeplot(famd_results)
+```
+
+Based on the FAMD variable importance plot remove other unimportant variables.
+```{r}
+#Remove unnecessary variables and create chem_labs
+patient_scale <- patient_scale %>%
+  select(-endocrine, -antihistamine, -steroid, -neurologic, -sedative, -vaccine,
+         -gi, -electrolytes_fluid, -other, -has_nicotine_depend, -gender)
+         
+```
+
+Split data
+```{r}
+RNGkind(sample.kind = "Rejection")
+set.seed(1313)
+train_index <- createDataPartition(patient_scale$HAI_flag, p = 0.7, list = FALSE)
+train_data <- patient_scale[train_index, ]
+test_data  <- patient_scale[-train_index, ]
+
+```
+
+No information Rate
+```{r}
+NIR <- max(table(patient_scale$HAI_flag)) / nrow(patient_scale)
+NIR
+```
+
+Handle class imbalance using a recipe of downsampling and upsampling
+```{r}
+#up sampling with mild down sampling
+rec_balanced <- recipe(HAI_flag ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_downsample(HAI_flag, under_ratio = 1.5) %>%
+  step_upsample(HAI_flag, over_ratio = 1.3)
+
+rec_balanced_prep <- prep(rec_balanced, training = train_data)
+balanced_train_data <- juice(rec_balanced_prep)
+
+```
+
+
+```{r}
+#Create the training control using 10-fold Cross-validation and ROC/Sens/Spec evaluation
+train_ctrl <- trainControl(
+      method = "cv",
+      number = 10,
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+```
+
+Baseline Full Logistic Regression Model
+```{r}
+#recipe
+fit_LR = train(rec_balanced,
+               data = train_data,
+               method = "glm",
+               trControl = train_ctrl)
+
+fit_LR
+```
+
+ROC curve for models:
+```{r, fig.width=5, fig.height=5}
+# LR Baseline model
+probs_LR_pred <- predict(fit_LR, newdata = test_data, type = "prob")[,2]
+
+# ROC Curves
+roc_LR <- roc(response = test_data$HAI_flag, predictor = probs_LR_pred)
+
+# Plot ROC Curves
+plot.roc(roc_LR, col = "navy", main = "Baseline ROC Logistic Regression Model", cex.main = 0.9, lwd = 2)
+
+# AUC Values
+auc_LR <- auc(roc_LR)
+
+# Add AUC Text
+text(x = 0.2, y = 0.35, labels = paste("AUC: ", round(auc_LR, 4)), col = "navy", cex = 0.8)
+  
+```       
+
+Random Forest Parameter Tuning
+```{r}
+#recipe
+RNGkind(sample.kind = "Rejection")
+set.seed(1313)
+
+fit_fullRF <- train(
+                rec_balanced,
+                data = train_data,
+                method = "rf",
+                tuneGrid = expand.grid(mtry = c(11, 12, 13)),
+                ntree = 400,
+                trControl = train_ctrl)
+fit_fullRF
+```
+
+#XGBoost
+```{r, warning=FALSE, message=FALSE}
+xgbGrid <- expand.grid(nrounds = 400,
+                       max_depth = c(2, 3, 4),
+                       eta = c(0.01, 0.02, 0.03), 
+                       gamma = 0,
+                       colsample_bytree = 1,
+                       min_child_weight = 1,
+                       subsample = 0.8)
+
+fit_xgbo <- train(
+               rec_balanced, 
+               data = train_data, 
+               method = "xgbTree", 
+               metric = "roc", 
+               trControl = train_ctrl, 
+               tuneGrid = xgbGrid
+               )
+
+fit_xgbo
+```
+
+Artificial Neural Networks
+```{r}
+RNGkind(sample.kind = "Rejection")
+set.seed(1313)
+fit_fullannu <- train(rec_balanced,
+                 data = train_data, 
+                 method = "nnet",
+                 tuneGrid = expand.grid(size = c(1, 2), 
+                                        decay = seq(0.22, 0.28, by = 0.02)),
+                 trace = FALSE,
+                 maxit = 400,
+                 trControl = train_ctrl)
+fit_fullannu
+```
+
+Find if ANN model converges:
+```{r}
+fit_fullannu$finalModel$convergence
+```
+
+double cross validation 
+```{r}
+RNGkind(sample.kind = "Rejection")
+set.seed(1313) #Set seed for consistency
+n = nrow(patient_scale) #define n on the rows in the dataset
+n_outer_folds = 5 #number of folds for double cross validation
+# initiate vector as a factor
+predicted_Outcome_outer = factor(vector(mode = "character", length = n), 
+                                  levels = levels(patient_scale$HAI_flag))
+
+groups = rep(1:n_outer_folds, length = n)
+cv_groups = sample(groups, n) # randomization for data in groups
+
+for(ii in 1:n_outer_folds){
+  in_test = (cv_groups == ii) # Testing set, logical vector indicating group ii
+  in_train = (cv_groups != ii) # Training set, logical vector indicating NOT group ii
+
+  # Training set, logical vector indicating NOT group ii
+  
+  train_fold <- patient_scale[in_train, ]
+  test_data = patient_scale[in_test, ]
+  # Add recipe to training fold
+  rec_balanced <- recipe(HAI_flag ~ ., data = train_data) %>%
+    step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors()) %>%
+    step_downsample(HAI_flag, under_ratio = 1.5) %>%
+    step_upsample(HAI_flag, over_ratio = 1.3)
+  
+  rec_fold <- prep(rec_balanced, training = train_fold)
+  dataused <- juice(rec_fold) #Data used in training for cross validation
+  test_data_processed <- bake(rec_fold, new_data = test_data)
+  
+  
+  
+  ctrl = trainControl(method = "cv", number = 10, classProbs = TRUE,
+                      summaryFunction = twoClassSummary) 
+  #10-fold cross validation
+
+  #models for cross validation
+  fit_lr = train(HAI_flag ~ .,
+                  data = dataused,
+                  method = "glm",
+                  metric = "ROC",
+                  trControl = ctrl)
+  fit_rf <- train(HAI_flag ~ .,
+                  data = dataused, 
+                  method = "rf",
+                  tuneGrid = expand.grid(mtry = c(11, 12, 13)),
+                  ntree = 400,
+                  metric = "ROC",
+                  trControl = ctrl)
+  fit_xgb <- train(HAI_flag ~ ., 
+                  data = dataused, 
+                  method = "xgbTree", 
+                  metric = "ROC", 
+                  trControl = ctrl, 
+                  tuneGrid = expand.grid(nrounds = 400,
+                                         max_depth = c(2, 3, 4),
+                                         eta = c(0.01, 0.02, 0.03),
+                                         gamma = 0,
+                                         colsample_bytree = 1,
+                                         min_child_weight = 1,
+                                         subsample = 0.8),
+                  verbosity = 0)
+  fit_ann = train(HAI_flag ~., 
+                  data = dataused,
+                  method = "nnet",
+                  tuneGrid = expand.grid(size = c(1, 2), 
+                                         decay = seq(0.22, 0.28, by = 0.02)),
+                  trace = FALSE,
+                  preProc = c("center", "scale"),
+                  maxit = 400,
+                  metric = "ROC",
+                  trControl = ctrl)
+  #pull the maximum ROC after 10 fold cross validation
+  all_roc_CV <- c(max(fit_lr$results$ROC),
+                  max(fit_rf$results$ROC),
+                  max(fit_xgb$results$ROC),
+                  max(fit_ann$results$ROC))
+  #List of all models in double cross validation                     
+  all_train_output <- list(fit_lr, fit_rf, fit_xgb, fit_ann)
+  
+  #Find the best models with the best accuracy for each fold in outer cross validation
+  allbest <- which(all_roc_CV == max(all_roc_CV))
+  whichbest <- ifelse(length(allbest)==1, allbest, sample(allbest,1))
+  bestmodel_train_output <- all_train_output[[whichbest]]
+  bestmodel_name <- c("Logistic Regression Full", 
+                      "Random Forest", "XGBoost", "ANN")[whichbest]
+  cat("\r Within outer fold", ii, ", the best model", "is", whichbest, "=", bestmodel_name)
+  cat('\nAt time', format(Sys.time(),'%H:%M:%S'))  # checking how long to run
+  #Use best model for prediction against the test set
+  pred_Outcome <- predict(bestmodel_train_output, newdata = test_data_processed)
+
+  predicted_Outcome_outer[in_test] <- pred_Outcome
+}
+
+table(predicted_Outcome_outer,patient_scale$HAI_flag) 
+#confusion matrix of best model predictions
+Accuracy_Outcome_CV = sum(predicted_Outcome_outer == patient_scale$HAI_flag)/n #Accuracy calculation
+Accuracy_Outcome_CV
+
+```
+
+Final Model fit:
+```{r}
+#Get the final best model
+bestmodel_train_output$finalModel
+
+#Bake the test data 
+test_data_baked <- bake(rec_balanced_prep, new_data = test_data)
+
+#Final model is fitted to the dataset
+predictions <- predict(bestmodel_train_output, newdata = test_data_baked)
+probs <- predict(bestmodel_train_output, newdata = test_data_baked, type = "prob")
+
+threshold <- 0.4 #Lower prediction threshold 
+predictions <- ifelse(probs[,"hai"] >= threshold, "hai", "not_hai")
+predictions <- factor(predictions, levels = levels(test_data_baked$HAI_flag))
+cm <- confusionMatrix(predictions, test_data_baked$HAI_flag, positive = "hai")
+cm
+```
+
+Confusion Matrix
+```{r}
+# Extract the table and convert to data frame 
+cm_df <- as.data.frame(cm$table)
+colnames(cm_df) <- c("Prediction", "Reference", "Freq")
+cm_df <- cm_df %>%
+  mutate(Correct = ifelse(Prediction == Reference, "Correct", "Incorrect"))
+
+# Heatmap 
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Correct, alpha = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) + 
+  geom_text(aes(label = Freq), color = "black", size = 5) + 
+  scale_fill_manual(values = c("Correct" = "steelblue", "Incorrect" = "darkorange")) +
+  scale_alpha(range = c(0.4, 1)) + 
+  labs( title = "Confusion Matrix Threshold of 0.4", x = "Actual Class", 
+        y = "Predicted Class", fill = "Prediction" ) + 
+  theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "none")
+
+```
+
+```{r}
+#Confusion matrix with sens, spec, ppv, and npv values
+sens <- round(cm$byClass["Sensitivity"], 3)
+spec <- round(cm$byClass["Specificity"], 3)
+ppv  <- round(cm$byClass["Pos Pred Value"], 3)
+npv  <- round(cm$byClass["Neg Pred Value"], 3)
+
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Correct, alpha = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  scale_fill_manual(values = c("Correct" = "steelblue", "Incorrect" = "darkorange")) +
+  scale_alpha(range = c(0.4, 1)) +
+  labs(
+    title = "Confusion Matrix (Threshold = 0.4)",
+    x = "Actual Class",
+    y = "Predicted Class"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none") +
+  
+  annotate("text", x = 1, y = 1,
+           label = paste0("Sensitivity: ", sens),
+           color = "black", hjust = 0.5, vjust = 1.85, size = 4.0) +
+  
+  annotate("text", x = 2, y = 2,
+           label = paste0("Specificity: ", spec),
+           color = "black", hjust = 0.5, vjust = 1.85, size = 4.0) +
+
+  annotate("text", x = 2, y = 1,
+           label = paste0("PPV: ", ppv),
+           color = "black", hjust = 0.45, vjust = 1.85, size = 4.0) +
+  
+  annotate("text", x = 1, y = 2,
+           label = paste0("NPV: ", npv),
+           color = "black", hjust = 0.45, vjust = 1.85, size = 4.0)
+```
+
+ROC curve for models:
+```{r, fig.width=5, fig.height=5}
+# Logistice Regression
+probs_lr <- predict(fit_LR, newdata = test_data, type = "prob")[,2]
+
+# Random Forest
+probs_rf <- predict(fit_fullRF, newdata = test_data, type = "prob")[,2]
+
+# XGBoost
+probs_xgb <- predict(fit_xgbo, newdata = test_data, type = "prob")[,2]
+
+# ANN
+probs_ann <- predict(fit_fullannu, newdata = test_data, type = "prob")[,2]
+
+# ROC Curves
+roc_lr <- roc(response = test_data$HAI_flag, predictor = probs_lr)
+roc_rf <- roc(response = test_data$HAI_flag, predictor = probs_rf)
+roc_xgb <- roc(response = test_data$HAI_flag, predictor = probs_xgb)
+roc_ann <- roc(response = test_data$HAI_flag, predictor = probs_ann)
+
+# Plot ROC Curves
+plot.roc(roc_lr, col = "navy", main = "ROC Curve comparing models", cex.main = 0.9, lwd = 2)
+lines(roc_rf, col = "darkgreen", lwd = 2)
+lines(roc_ann, col = "darkorange", lwd = 2)
+lines(roc_xgb, col = "maroon", lwd = 2)
+
+# AUC Values
+auc_lr <- auc(roc_lr)
+auc_rf <- auc(roc_rf)
+auc_ann <- auc(roc_ann)
+auc_xgb <- auc(roc_xgb)
+
+# Add AUC Text
+text(x = 0.2, y = 0.25, labels = paste("AUC: ", round(auc_lr, 4)), col = "navy", cex = 0.8)
+text(x = 0.2, y = 0.55, labels = paste("AUC: ", round(auc_rf, 4)), col = "darkgreen", cex = 0.8)
+text(x = 0.2, y = 0.35, labels = paste("AUC: ", round(auc_ann, 4)), col = "darkorange", cex = 0.8)
+text(x = 0.2, y = 0.45, labels = paste("AUC: ", round(auc_xgb, 4)), col = "maroon", cex = 0.8)
+
+# Add Legend
+legend("bottomright", legend = c("Random Forest", "XGBoost", "ANN", "Logistic Regression"  ), col = c( "darkgreen", "maroon", "darkorange", "navy" ), lwd = 2, cex = 0.7)
+```
+
+Variable importance plot
+```{r}
+varImp(bestmodel_train_output)
+plot(varImp(bestmodel_train_output), top = 20, main = "Variable Importance")
+
+```
+
+Are antiseptic and has_surg correlated?
+```{r}
+#Look at chi-square test
+chisq.test(patient_scale$antiseptic, patient_scale$has_surg)
+
+table(patient_scale$antiseptic, patient_scale$has_surg)
+prop.table(table(patient_scale$antiseptic, patient_scale$has_surg))
+```
+
+There is statistical association with antiseptics and surgery but not all patient who have antiseptics also had surgery or all surgeries had chlorohexidine. Chlorohexidine can also be used in mouth washes and wound treatment. Will keep both predictors as is in the models.
+
+Partial Dependency Plot
+```{R}
+patient_df <- as.data.frame(test_data_processed)
+
+proc_plot <- partialPlot(
+  x = bestmodel_train_output$finalModel,                   
+  pred.data = patient_df,       
+  x.var = "num_procedures_log", 
+  which.class = "hai",          
+  main = "Partial Dependence of Number of Procedures on HAI",
+  xlab = "Log of Number of Procedures",
+  ylab = "Predicted Probability of HAI"
+)
+icu_los_plot <- partialPlot(
+  x = bestmodel_train_output$finalModel,                   
+  pred.data = patient_df,       
+  x.var = "icu_los_log", 
+  which.class = "hai",          
+  main = "Partial Dependence of Length of Stay on HAI",
+  xlab = "Log of Number of ICU length of stay",
+  ylab = "Predicted Probability of HAI"
+)
+num_diag_plot <- partialPlot(
+  x = bestmodel_train_output$finalModel,                   
+  pred.data = patient_df,       
+  x.var = "num_diagnoses", 
+  which.class = "hai",          
+  main = "Partial Dependence of Number of Diagnoses on HAI",
+  xlab = "Number of diagnoses",
+  ylab = "Predicted Probability of HAI"
+)
+age_plot <- partialPlot(
+  x = bestmodel_train_output$finalModel,                   
+  pred.data = patient_df,       
+  x.var = "anchor_age", 
+  which.class = "hai",          
+  main = "Partial Dependence of Age on HAI",
+  xlab = "Age",
+  ylab = "Predicted Probability of HAI"
+)
+antiseptics_plot <- partialPlot(
+  x = bestmodel_train_output$finalModel,                   
+  pred.data = patient_df,       
+  x.var = "antiseptic_X1", 
+  which.class = "hai",          
+  main = "Partial Dependence of the use of Antiseptics on HAI",
+  xlab = "Antiseptics",
+  ylab = "Predicted Probability of HAI"
+)
+
+```
+
+Export Clean patient table so all other code does not need to be execute prior to EDA and model building and evaluation.
+```{r}
+write_csv(clean_patient, "clean_patient.csv")
+```
+
+Export the summary patient table
+```{r}
+final_tbl %>%
+  as_gt() %>%
+  gt::gtsave("summarytable.pdf")
+```
+
